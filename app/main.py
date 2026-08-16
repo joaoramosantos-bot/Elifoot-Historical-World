@@ -73,3 +73,29 @@ def matches(id: str, db: Session = Depends(get_db)):
 def history(id: str, db: Session = Depends(get_db)):
     if not db.get(GameWorld,id): raise HTTPException(404,"World not found")
     return rows(HistoricalEvent,id,db)
+
+@app.get("/world/{id}/standings")
+def standings(id: str, db: Session = Depends(get_db)):
+    if not db.get(GameWorld,id): raise HTTPException(404,"World not found")
+    return [
+        {k:v for k,v in r.__dict__.items() if k != "_sa_instance_state"}
+        for r in db.scalars(select(Standing).join(Season, Standing.season_id == Season.id).join(Competition, Season.competition_id == Competition.id).where(Competition.world_id == id).order_by(Standing.points.desc(), Standing.goal_difference.desc())).all()
+    ]
+
+@app.get("/world/{id}/rankings/clubs")
+def club_rankings(id: str, season_year: int | None = None, db: Session = Depends(get_db)):
+    if not db.get(GameWorld,id): raise HTTPException(404,"World not found")
+    query = select(ClubCoefficient).where(ClubCoefficient.world_id == id)
+    if season_year is not None:
+        query = query.where(ClubCoefficient.season_year == season_year)
+    return [{k:v for k,v in r.__dict__.items() if k != "_sa_instance_state"}
+            for r in db.scalars(query.order_by(ClubCoefficient.coefficient.desc())).all()]
+
+@app.get("/world/{id}/rankings/countries")
+def country_rankings(id: str, season_year: int | None = None, db: Session = Depends(get_db)):
+    if not db.get(GameWorld,id): raise HTTPException(404,"World not found")
+    query = select(CountryCoefficient).where(CountryCoefficient.world_id == id)
+    if season_year is not None:
+        query = query.where(CountryCoefficient.season_year == season_year)
+    return [{k:v for k,v in r.__dict__.items() if k != "_sa_instance_state"}
+            for r in db.scalars(query.order_by(CountryCoefficient.coefficient.desc())).all()]

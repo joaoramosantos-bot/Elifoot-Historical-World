@@ -163,6 +163,56 @@ class FinancialTransaction(Base):
     amount: Mapped[float] = mapped_column(Float)
     description: Mapped[str] = mapped_column(Text, default="")
 
+class HistoricalCompetitionRule(Base):
+    __tablename__ = "historical_competition_rules"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scope: Mapped[str] = mapped_column(String(40), default="national")
+    country_id: Mapped[int | None] = mapped_column(ForeignKey("countries.id"), nullable=True)
+    name: Mapped[str] = mapped_column(String(140))
+    valid_from: Mapped[date] = mapped_column(Date)
+    valid_to: Mapped[date | None] = mapped_column(Date, nullable=True)
+    format: Mapped[str] = mapped_column(String(40), default="league")
+    min_clubs: Mapped[int] = mapped_column(Integer, default=8)
+    max_clubs: Mapped[int] = mapped_column(Integer, default=20)
+    matches_per_opponent: Mapped[int] = mapped_column(Integer, default=2)
+    season_start_month: Mapped[int] = mapped_column(Integer, default=9)
+    season_end_month: Mapped[int] = mapped_column(Integer, default=6)
+    international: Mapped[bool] = mapped_column(Boolean, default=False)
+
+class Standing(Base):
+    __tablename__ = "standings"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    season_id: Mapped[int] = mapped_column(ForeignKey("seasons.id"), index=True)
+    club_id: Mapped[int] = mapped_column(ForeignKey("clubs.id"), index=True)
+    played: Mapped[int] = mapped_column(Integer, default=0)
+    wins: Mapped[int] = mapped_column(Integer, default=0)
+    draws: Mapped[int] = mapped_column(Integer, default=0)
+    losses: Mapped[int] = mapped_column(Integer, default=0)
+    goals_for: Mapped[int] = mapped_column(Integer, default=0)
+    goals_against: Mapped[int] = mapped_column(Integer, default=0)
+    goal_difference: Mapped[int] = mapped_column(Integer, default=0)
+    points: Mapped[int] = mapped_column(Integer, default=0)
+
+class ClubCoefficient(Base):
+    __tablename__ = "club_coefficients"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    world_id: Mapped[str] = mapped_column(ForeignKey("game_worlds.id"), index=True)
+    club_id: Mapped[int] = mapped_column(ForeignKey("clubs.id"), index=True)
+    season_year: Mapped[int] = mapped_column(Integer, index=True)
+    participation_points: Mapped[float] = mapped_column(Float, default=0)
+    result_points: Mapped[float] = mapped_column(Float, default=0)
+    progression_points: Mapped[float] = mapped_column(Float, default=0)
+    coefficient: Mapped[float] = mapped_column(Float, default=0)
+
+class CountryCoefficient(Base):
+    __tablename__ = "country_coefficients"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    world_id: Mapped[str] = mapped_column(ForeignKey("game_worlds.id"), index=True)
+    country_id: Mapped[int] = mapped_column(ForeignKey("countries.id"), index=True)
+    season_year: Mapped[int] = mapped_column(Integer, index=True)
+    coefficient: Mapped[float] = mapped_column(Float, default=0)
+    club_count: Mapped[int] = mapped_column(Integer, default=0)
+
 class HistoricalEvent(Base):
     __tablename__ = "historical_events"
     id: Mapped[int] = mapped_column(primary_key=True)
