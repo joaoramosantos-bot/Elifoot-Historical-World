@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 import random
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -17,6 +17,11 @@ class SimulationEngine:
 
     def run_month(self):
         self.world.current_date = advance_month(self.world.current_date)
+        self.process_monthly_events()
+        self.db.commit()
+        return self.world
+
+    def process_monthly_events(self):
         self.process_historical_events()
         self.age_and_develop_players()
         self.process_injuries()
@@ -31,8 +36,46 @@ class SimulationEngine:
         self.generate_players_if_needed()
         self.process_retirements()
         self.process_club_lifecycle()
+
+    def run_day(self):
+        if self.world.current_date.day == 1:
+            self.process_monthly_events()
+        else:
+            self.ensure_competitions()
+            self.play_matches()
+            self.update_standings()
+            self.update_coefficients()
+        self.db.flush()
+
+    def advance_to_date(self, target_date):
+        while self.world.current_date < target_date:
+            self.world.current_date = self.world.current_date + timedelta(days=1)
+            self.run_day()
         self.db.commit()
         return self.world
+
+    def next_match_for_player_club(self):
+        if not self.world.player_club_id:
+            return None
+        self.ensure_competitions()
+        self.play_matches()
+        self.db.flush()
+        return self.db.scalar(select(Match).where(
+            Match.world_id == self.world.id,
+            Match.played == False,
+            Match.played_on >= self.world.current_date,
+            (Match.home_club_id == self.world.player_club_id) | (Match.away_club_id == self.world.player_club_id),
+        ).order_by(Match.played_on, Match.id))
+
+    def advance_to_next_match(self):
+        match = self.next_match_for_player_club()
+        if not match:
+            self.db.commit()
+            return None
+        stop_date = max(self.world.current_date, match.played_on - timedelta(days=1))
+        self.advance_to_date(stop_date)
+        self.db.refresh(match)
+        return match
 
     def process_historical_events(self):
         if self.world.current_date == date(1900, 10, 1):
@@ -155,9 +198,10 @@ class SimulationEngine:
                 Competition.valid_from <= self.world.current_date,
                 Competition.valid_to.is_(None)))
             if not exists:
+                comp_start = max(rule.valid_from, self.season_bounds(self.season_year())[0])
                 self.db.add(Competition(
                     world_id=self.world.id, country_id=country.id,
-                    name=rule.name, valid_from=self.world.current_date,
+                    name=rule.name, valid_from=comp_start,
                     format=rule.format, club_count=min(len(clubs), rule.max_clubs),
                     division_level=1, international=rule.international
                 ))
@@ -170,7 +214,7 @@ class SimulationEngine:
                 if not second:
                     self.db.add(Competition(
                         world_id=self.world.id, country_id=country.id,
-                        name=f"{rule.name} II", valid_from=self.world.current_date,
+                        name=f"{rule.name} II", valid_from=max(rule.valid_from, self.season_bounds(self.season_year())[0]),
                         format=rule.format, club_count=min(len(clubs) - rule.min_clubs, rule.max_clubs),
                         division_level=2, international=False
                     ))
@@ -208,24 +252,31 @@ class SimulationEngine:
         return pairs
 
     def schedule_season_matches(self, comp, season, clubs, rule):
+        schedule_start = max(season.start_date, comp.valid_from) + timedelta(days=7)
+        if schedule_start > season.end_date:
+            return
         existing = self.db.scalars(select(Match).where(Match.season_id == season.id)).all()
         existing_keys = {(m.home_club_id, m.away_club_id, m.played_on) for m in existing}
         pairs = self.league_pairs(clubs, rule.matches_per_opponent)
-        months = [9, 10, 11, 12, 1, 2, 3, 4, 5, 6]
+        if not pairs:
+            return
+        total_days = max(1, (season.end_date - schedule_start).days)
+        step_days = max(1, total_days // max(1, len(pairs) - 1))
         for idx, (home, away) in enumerate(pairs):
-            month = months[idx % len(months)]
-            year = season.start_date.year if month >= 9 else season.end_date.year
-            played_on = date(year, month, 1)
-            key = (home.id, away.id, played_on)
-            reverse_key = (away.id, home.id, played_on)
-            if key in existing_keys or reverse_key in existing_keys:
-                continue
+            played_on = schedule_start + timedelta(days=idx * step_days)
+            if played_on > season.end_date:
+                played_on = season.end_date
+            # Keep league matches on real calendar dates and spread clashes if needed.
+            while (home.id, away.id, played_on) in existing_keys or (away.id, home.id, played_on) in existing_keys:
+                played_on = played_on + timedelta(days=1)
+                if played_on > season.end_date:
+                    raise ValueError("Impossible league calendar: duplicate fixture cannot be placed")
             self.db.add(Match(
                 world_id=self.world.id, competition_id=comp.id, season_id=season.id,
                 played_on=played_on, home_club_id=home.id, away_club_id=away.id,
                 home_goals=0, away_goals=0, played=False
             ))
-            existing_keys.add(key)
+            existing_keys.add((home.id, away.id, played_on))
 
     def play_matches(self):
         competitions = self.db.scalars(select(Competition).where(
@@ -253,7 +304,7 @@ class SimulationEngine:
                 self.db.flush()
             due = self.db.scalars(select(Match).where(
                 Match.season_id == season.id,
-                Match.played_on == self.world.current_date,
+                Match.played_on <= self.world.current_date,
                 Match.played == False)).all()
             for match in due:
                 home = self.db.get(Club, match.home_club_id)

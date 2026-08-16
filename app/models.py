@@ -10,6 +10,7 @@ class GameWorld(Base):
     current_date: Mapped[date] = mapped_column(Date, nullable=False)
     seed: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[date] = mapped_column(Date, nullable=False)
+    player_club_id: Mapped[int | None] = mapped_column(ForeignKey("clubs.id"), nullable=True)
 
 class Country(Base):
     __tablename__ = "countries"

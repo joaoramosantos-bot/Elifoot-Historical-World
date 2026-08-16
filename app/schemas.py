@@ -11,3 +11,7 @@ class WorldOut(BaseModel):
     name: str
     current_date: date
     seed: int
+
+
+class PlayerClubSelect(BaseModel):
+    club_id: int

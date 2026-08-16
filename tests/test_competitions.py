@@ -107,3 +107,51 @@ def test_simulation_continues_after_2026():
     db = session(); w = world(db, date(2026, 12, 1))
     SimulationEngine(db, w).run_month()
     assert w.current_date == date(2027, 1, 1)
+
+
+def scheduled_world(db, current_date=date(1900, 9, 1), club_count=8):
+    w = world(db, current_date); c = country(db, w); created = clubs(db, w, c, club_count)
+    e = SimulationEngine(db, w); e.ensure_competitions(); db.flush(); e.play_matches(); db.flush()
+    return w, c, created, db.scalar(select(Season))
+
+
+def test_select_and_persist_player_club_on_world():
+    db = session(); w = world(db); c = country(db, w); selected = clubs(db, w, c, 1)[0]
+    w.player_club_id = selected.id; db.commit()
+    loaded = db.get(GameWorld, w.id)
+    assert loaded.player_club_id == selected.id
+
+
+def test_schedule_uses_concrete_dates_and_finds_next_match():
+    db = session(); w, _c, created, _season = scheduled_world(db)
+    w.player_club_id = created[0].id; db.flush()
+    matches = db.scalars(select(Match).where(Match.world_id == w.id).order_by(Match.played_on)).all()
+    assert matches
+    assert any(m.played_on.day != 1 for m in matches)
+    next_match = SimulationEngine(db, w).next_match_for_player_club()
+    assert next_match is not None
+    assert created[0].id in (next_match.home_club_id, next_match.away_club_id)
+    assert next_match.played_on >= w.current_date
+
+
+def test_advance_to_next_match_stops_before_match_date_and_does_not_play_it():
+    db = session(); w, _c, created, _season = scheduled_world(db)
+    w.player_club_id = created[0].id; db.flush()
+    e = SimulationEngine(db, w)
+    next_match = e.next_match_for_player_club()
+    match_date = next_match.played_on
+    returned = e.advance_to_next_match()
+    assert returned.id == next_match.id
+    assert w.current_date == match_date - __import__('datetime').timedelta(days=1)
+    assert w.current_date < match_date
+    assert db.get(Match, next_match.id).played is False
+
+
+def test_match_calendar_still_respects_duplicate_and_36_game_rules_after_2026():
+    db = session(); w, _c, created, season = scheduled_world(db, date(2027, 9, 1), 20)
+    matches = db.scalars(select(Match).where(Match.season_id == season.id)).all()
+    keys = {(m.home_club_id, m.away_club_id, m.played_on) for m in matches}
+    assert len(keys) == len(matches)
+    for club in created:
+        count = sum(1 for m in matches if club.id in (m.home_club_id, m.away_club_id))
+        assert count <= 36
