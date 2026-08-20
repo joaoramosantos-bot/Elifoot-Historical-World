@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 import random
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -17,20 +17,65 @@ class SimulationEngine:
 
     def run_month(self):
         self.world.current_date = advance_month(self.world.current_date)
+        self.process_monthly_events()
+        self.db.commit()
+        return self.world
+
+    def process_monthly_events(self):
         self.process_historical_events()
         self.age_and_develop_players()
         self.process_injuries()
         self.process_contracts()
         self.process_transfers()
+        self.process_club_births()
         self.ensure_competitions()
         self.play_matches()
         self.update_standings()
+        self.update_coefficients()
         self.process_finances()
         self.generate_players_if_needed()
         self.process_retirements()
         self.process_club_lifecycle()
+
+    def run_day(self):
+        if self.world.current_date.day == 1:
+            self.process_monthly_events()
+        else:
+            self.ensure_competitions()
+            self.play_matches()
+            self.update_standings()
+            self.update_coefficients()
+        self.db.flush()
+
+    def advance_to_date(self, target_date):
+        while self.world.current_date < target_date:
+            self.world.current_date = self.world.current_date + timedelta(days=1)
+            self.run_day()
         self.db.commit()
         return self.world
+
+    def next_match_for_player_club(self):
+        if not self.world.player_club_id:
+            return None
+        self.ensure_competitions()
+        self.play_matches()
+        self.db.flush()
+        return self.db.scalar(select(Match).where(
+            Match.world_id == self.world.id,
+            Match.played == False,
+            Match.played_on >= self.world.current_date,
+            (Match.home_club_id == self.world.player_club_id) | (Match.away_club_id == self.world.player_club_id),
+        ).order_by(Match.played_on, Match.id))
+
+    def advance_to_next_match(self):
+        match = self.next_match_for_player_club()
+        if not match:
+            self.db.commit()
+            return None
+        stop_date = max(self.world.current_date, match.played_on - timedelta(days=1))
+        self.advance_to_date(stop_date)
+        self.db.refresh(match)
+        return match
 
     def process_historical_events(self):
         if self.world.current_date == date(1900, 10, 1):
@@ -85,26 +130,93 @@ class SimulationEngine:
     def process_transfers(self):
         pass
 
+    def eligible_clubs(self, country, division_level=1):
+        return self.db.scalars(select(Club).where(
+            Club.world_id == self.world.id,
+            Club.country_id == country.id,
+            Club.division_level == division_level,
+            Club.active == True,
+            Club.founded <= self.world.current_date
+        ).order_by(Club.id)).all()
+
+    def competition_rule_for(self, country):
+        rule = self.db.scalar(select(HistoricalCompetitionRule).where(
+            HistoricalCompetitionRule.scope == "national",
+            HistoricalCompetitionRule.country_id == country.id,
+            HistoricalCompetitionRule.valid_from <= self.world.current_date,
+            (HistoricalCompetitionRule.valid_to.is_(None)) | (HistoricalCompetitionRule.valid_to >= self.world.current_date)
+        ).order_by(HistoricalCompetitionRule.valid_from.desc()))
+        if rule:
+            return rule
+        return HistoricalCompetitionRule(
+            scope="national", country_id=country.id,
+            name=f"Campeonato Nacional de {country.name}",
+            valid_from=date(1900, 1, 1), min_clubs=8, max_clubs=20,
+            matches_per_opponent=2, season_start_month=9, season_end_month=6
+        )
+
+    def process_club_births(self):
+        countries = self.db.scalars(select(Country).where(
+            Country.world_id == self.world.id,
+            Country.valid_from <= self.world.current_date,
+            (Country.valid_to.is_(None)) | (Country.valid_to >= self.world.current_date))).all()
+        for country in countries:
+            active_count = len(self.db.scalars(select(Club).where(
+                Club.world_id == self.world.id, Club.country_id == country.id,
+                Club.active == True)).all())
+            target = min(8, max(0, int(country.popularity // 10) + int((self.world.current_date.year - 1900) // 20)))
+            if active_count >= target:
+                continue
+            club = Club(
+                world_id=self.world.id, country_id=country.id, city_id=None,
+                name=f"{country.name} Historical Club {active_count + 1}",
+                founded=self.world.current_date, division_level=1,
+                strength=15 + country.player_quality * 0.4, reputation=10,
+                cash=1000 + country.finance * 20, stadium_capacity=500
+            )
+            self.db.add(club)
+            self.db.flush()
+            self.db.add(HistoricalEvent(
+                world_id=self.world.id, event_date=self.world.current_date,
+                event_type="club_foundation", title=f"{club.name} fundado",
+                description="Um novo clube nasceu dinamicamente na simulação."
+            ))
+
     def ensure_competitions(self):
         countries = self.db.scalars(select(Country).where(
             Country.world_id == self.world.id,
             Country.valid_from <= self.world.current_date)).all()
         for country in countries:
+            clubs = self.eligible_clubs(country, 1)
+            rule = self.competition_rule_for(country)
+            if len(clubs) < rule.min_clubs:
+                continue
             exists = self.db.scalar(select(Competition).where(
                 Competition.world_id == self.world.id,
                 Competition.country_id == country.id,
+                Competition.division_level == 1,
                 Competition.valid_from <= self.world.current_date,
                 Competition.valid_to.is_(None)))
             if not exists:
-                clubs = self.db.scalars(select(Club).where(
-                    Club.country_id == country.id, Club.active == True)).all()
-                if clubs:
+                comp_start = max(rule.valid_from, self.season_bounds(self.season_year())[0])
+                self.db.add(Competition(
+                    world_id=self.world.id, country_id=country.id,
+                    name=rule.name, valid_from=comp_start,
+                    format=rule.format, club_count=min(len(clubs), rule.max_clubs),
+                    division_level=1, international=rule.international
+                ))
+            if len(clubs) >= rule.min_clubs * 2:
+                second = self.db.scalar(select(Competition).where(
+                    Competition.world_id == self.world.id,
+                    Competition.country_id == country.id,
+                    Competition.division_level == 2,
+                    Competition.valid_to.is_(None)))
+                if not second:
                     self.db.add(Competition(
                         world_id=self.world.id, country_id=country.id,
-                        name=f"Campeonato Nacional de {country.name}",
-                        valid_from=self.world.current_date,
-                        format="league", club_count=max(2, len(clubs)),
-                        division_level=1
+                        name=f"{rule.name} II", valid_from=max(rule.valid_from, self.season_bounds(self.season_year())[0]),
+                        format=rule.format, club_count=min(len(clubs) - rule.min_clubs, rule.max_clubs),
+                        division_level=2, international=False
                     ))
 
     def club_strength(self, club):
@@ -122,51 +234,165 @@ class SimulationEngine:
         xa = max(0.10, 1.05 * af / max(1, hf * home_adv) + self.rng.uniform(-0.35, 0.35))
         return min(8, int(xh)), min(8, int(xa))
 
+    def season_bounds(self, year):
+        return date(year, 9, 1), date(year + 1, 6, 30)
+
+    def season_year(self):
+        return self.world.current_date.year if self.world.current_date.month >= 9 else self.world.current_date.year - 1
+
+    def league_pairs(self, clubs, matches_per_opponent):
+        max_rounds_per_pair = min(4, max(1, matches_per_opponent))
+        while (len(clubs) - 1) * max_rounds_per_pair > 36:
+            max_rounds_per_pair -= 1
+        pairs = []
+        for idx, home in enumerate(clubs):
+            for away in clubs[idx + 1:]:
+                for n in range(max_rounds_per_pair):
+                    pairs.append((home, away) if n % 2 == 0 else (away, home))
+        return pairs
+
+    def schedule_season_matches(self, comp, season, clubs, rule):
+        schedule_start = max(season.start_date, comp.valid_from) + timedelta(days=7)
+        if schedule_start > season.end_date:
+            return
+        existing = self.db.scalars(select(Match).where(Match.season_id == season.id)).all()
+        existing_keys = {(m.home_club_id, m.away_club_id, m.played_on) for m in existing}
+        pairs = self.league_pairs(clubs, rule.matches_per_opponent)
+        if not pairs:
+            return
+        total_days = max(1, (season.end_date - schedule_start).days)
+        step_days = max(1, total_days // max(1, len(pairs) - 1))
+        for idx, (home, away) in enumerate(pairs):
+            played_on = schedule_start + timedelta(days=idx * step_days)
+            if played_on > season.end_date:
+                played_on = season.end_date
+            # Keep league matches on real calendar dates and spread clashes if needed.
+            while (home.id, away.id, played_on) in existing_keys or (away.id, home.id, played_on) in existing_keys:
+                played_on = played_on + timedelta(days=1)
+                if played_on > season.end_date:
+                    raise ValueError("Impossible league calendar: duplicate fixture cannot be placed")
+            self.db.add(Match(
+                world_id=self.world.id, competition_id=comp.id, season_id=season.id,
+                played_on=played_on, home_club_id=home.id, away_club_id=away.id,
+                home_goals=0, away_goals=0, played=False
+            ))
+            existing_keys.add((home.id, away.id, played_on))
+
     def play_matches(self):
         competitions = self.db.scalars(select(Competition).where(
             Competition.world_id == self.world.id,
             Competition.valid_from <= self.world.current_date,
             Competition.valid_to.is_(None))).all()
         for comp in competitions:
-            clubs = self.db.scalars(select(Club).where(
-                Club.country_id == comp.country_id, Club.active == True,
-                Club.division_level == comp.division_level)).all()
-            if len(clubs) < 2:
+            if comp.format != "league" or comp.international:
                 continue
+            country = self.db.get(Country, comp.country_id)
+            rule = self.competition_rule_for(country)
+            clubs = self.eligible_clubs(country, comp.division_level)[:comp.club_count]
+            if len(clubs) < rule.min_clubs:
+                continue
+            start, end = self.season_bounds(self.season_year())
             season = self.db.scalar(select(Season).where(
                 Season.competition_id == comp.id,
-                Season.start_date <= self.world.current_date,
-                Season.end_date >= self.world.current_date))
+                Season.start_date == start,
+                Season.end_date == end))
             if not season:
-                season = Season(
-                    competition_id=comp.id,
-                    start_date=date(self.world.current_date.year, 9, 1),
-                    end_date=date(self.world.current_date.year + 1, 6, 30)
-                )
+                season = Season(competition_id=comp.id, start_date=start, end_date=end)
                 self.db.add(season)
                 self.db.flush()
-            offset = self.world.current_date.month - 9
-            for i in range(0, len(clubs)-1, 2):
-                h = clubs[(i + offset) % len(clubs)]
-                a = clubs[(i + 1 + offset) % len(clubs)]
-                if h.id == a.id:
+                self.schedule_season_matches(comp, season, clubs, rule)
+                self.db.flush()
+            due = self.db.scalars(select(Match).where(
+                Match.season_id == season.id,
+                Match.played_on <= self.world.current_date,
+                Match.played == False)).all()
+            for match in due:
+                home = self.db.get(Club, match.home_club_id)
+                away = self.db.get(Club, match.away_club_id)
+                if not home or not away:
                     continue
-                existing = self.db.scalar(select(Match).where(
-                    Match.competition_id == comp.id,
-                    Match.played_on == self.world.current_date,
-                    Match.home_club_id == h.id,
-                    Match.away_club_id == a.id))
-                if existing:
-                    continue
-                hg, ag = self.simulate_match(h, a)
-                self.db.add(Match(
-                    world_id=self.world.id, competition_id=comp.id,
-                    season_id=season.id, played_on=self.world.current_date,
-                    home_club_id=h.id, away_club_id=a.id,
-                    home_goals=hg, away_goals=ag, played=True))
+                match.home_goals, match.away_goals = self.simulate_match(home, away)
+                match.played = True
 
     def update_standings(self):
-        pass
+        seasons = self.db.scalars(select(Season).where(
+            Season.start_date <= self.world.current_date,
+            Season.end_date >= self.world.current_date)).all()
+        for season in seasons:
+            for old in self.db.scalars(select(Standing).where(Standing.season_id == season.id)).all():
+                self.db.delete(old)
+            rows = {}
+            matches = self.db.scalars(select(Match).where(
+                Match.season_id == season.id, Match.played == True)).all()
+            for match in matches:
+                for club_id in (match.home_club_id, match.away_club_id):
+                    rows.setdefault(club_id, dict(played=0, wins=0, draws=0, losses=0, goals_for=0, goals_against=0, points=0))
+                home = rows[match.home_club_id]
+                away = rows[match.away_club_id]
+                home["played"] += 1; away["played"] += 1
+                home["goals_for"] += match.home_goals; home["goals_against"] += match.away_goals
+                away["goals_for"] += match.away_goals; away["goals_against"] += match.home_goals
+                if match.home_goals > match.away_goals:
+                    home["wins"] += 1; home["points"] += 3; away["losses"] += 1
+                elif match.home_goals < match.away_goals:
+                    away["wins"] += 1; away["points"] += 3; home["losses"] += 1
+                else:
+                    home["draws"] += 1; away["draws"] += 1; home["points"] += 1; away["points"] += 1
+            for club_id, row in rows.items():
+                self.db.add(Standing(
+                    season_id=season.id, club_id=club_id,
+                    goal_difference=row["goals_for"] - row["goals_against"], **row
+                ))
+
+    def european_competitions_started(self):
+        return self.db.scalar(select(HistoricalCompetitionRule).where(
+            HistoricalCompetitionRule.scope == "international",
+            HistoricalCompetitionRule.valid_from <= self.world.current_date,
+            HistoricalCompetitionRule.international == True)) is not None
+
+    def update_coefficients(self):
+        if not self.european_competitions_started():
+            return
+        season_year = self.season_year()
+        international_matches = self.db.scalars(select(Match).join(Competition, Match.competition_id == Competition.id).where(
+            Match.world_id == self.world.id, Match.played == True, Competition.international == True)).all()
+        club_points = {}
+        for match in international_matches:
+            club_points.setdefault(match.home_club_id, 1.0)
+            club_points.setdefault(match.away_club_id, 1.0)
+            if match.home_goals > match.away_goals:
+                club_points[match.home_club_id] += 2
+            elif match.home_goals < match.away_goals:
+                club_points[match.away_club_id] += 2
+            else:
+                club_points[match.home_club_id] += 1
+                club_points[match.away_club_id] += 1
+        for club_id, points in club_points.items():
+            coeff = self.db.scalar(select(ClubCoefficient).where(
+                ClubCoefficient.world_id == self.world.id,
+                ClubCoefficient.club_id == club_id,
+                ClubCoefficient.season_year == season_year))
+            if not coeff:
+                coeff = ClubCoefficient(world_id=self.world.id, club_id=club_id, season_year=season_year)
+                self.db.add(coeff)
+            coeff.participation_points = 1
+            coeff.result_points = max(0, points - 1)
+            coeff.coefficient = points
+        countries = {}
+        for club_id, points in club_points.items():
+            club = self.db.get(Club, club_id)
+            if club:
+                countries.setdefault(club.country_id, []).append(points)
+        for country_id, points in countries.items():
+            coeff = self.db.scalar(select(CountryCoefficient).where(
+                CountryCoefficient.world_id == self.world.id,
+                CountryCoefficient.country_id == country_id,
+                CountryCoefficient.season_year == season_year))
+            if not coeff:
+                coeff = CountryCoefficient(world_id=self.world.id, country_id=country_id, season_year=season_year)
+                self.db.add(coeff)
+            coeff.club_count = len(points)
+            coeff.coefficient = sum(points) / len(points)
 
     def process_finances(self):
         clubs = self.db.scalars(select(Club).where(
@@ -194,6 +420,9 @@ class SimulationEngine:
         countries = self.db.scalars(select(Country).where(Country.world_id == self.world.id)).all()
         clubs = self.db.scalars(select(Club).where(
             Club.world_id == self.world.id, Club.active == True)).all()
+        if not countries:
+            return
+
         target = max(12, len(clubs) * 16)
         current = len(self.db.scalars(select(Player).where(
             Player.world_id == self.world.id, Player.retired == False)).all())

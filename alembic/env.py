@@ -7,7 +7,7 @@ from app.db import Base
 from app import models
 
 config = context.config
-if config.config_file_name:
+if config.config_file_name and config.file_config.has_section("formatters"):
     fileConfig(config.config_file_name)
 target_metadata = Base.metadata
 
