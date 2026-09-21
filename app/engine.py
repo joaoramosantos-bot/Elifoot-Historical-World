@@ -33,9 +33,17 @@ class SimulationEngine:
         return self.world
 
     def process_historical_events(self):
-        if self.world.current_date == date(1900, 10, 1):
+        event_date = date(1900, 10, 1)
+        if self.world.current_date < event_date:
+            return
+        exists = self.db.scalar(select(HistoricalEvent).where(
+            HistoricalEvent.world_id == self.world.id,
+            HistoricalEvent.event_type == "world",
+            HistoricalEvent.title == "Primeiro mês da simulação"
+        ))
+        if not exists:
             self.db.add(HistoricalEvent(
-                world_id=self.world.id, event_date=self.world.current_date,
+                world_id=self.world.id, event_date=event_date,
                 event_type="world", title="Primeiro mês da simulação",
                 description="A simulação histórica entrou em Outubro de 1900."
             ))
@@ -90,22 +98,26 @@ class SimulationEngine:
             Country.world_id == self.world.id,
             Country.valid_from <= self.world.current_date)).all()
         for country in countries:
+            clubs = self.db.scalars(select(Club).where(
+                Club.world_id == self.world.id,
+                Club.country_id == country.id,
+                Club.active == True)).all()
+            if len(clubs) < 8:
+                continue
             exists = self.db.scalar(select(Competition).where(
                 Competition.world_id == self.world.id,
                 Competition.country_id == country.id,
+                Competition.division_level == 1,
                 Competition.valid_from <= self.world.current_date,
                 Competition.valid_to.is_(None)))
             if not exists:
-                clubs = self.db.scalars(select(Club).where(
-                    Club.country_id == country.id, Club.active == True)).all()
-                if clubs:
-                    self.db.add(Competition(
-                        world_id=self.world.id, country_id=country.id,
-                        name=f"Campeonato Nacional de {country.name}",
-                        valid_from=self.world.current_date,
-                        format="league", club_count=max(2, len(clubs)),
-                        division_level=1
-                    ))
+                self.db.add(Competition(
+                    world_id=self.world.id, country_id=country.id,
+                    name=f"Campeonato Nacional de {country.name}",
+                    valid_from=self.world.current_date,
+                    format="league", club_count=min(10, len(clubs)),
+                    division_level=1
+                ))
 
     def club_strength(self, club):
         players = self.db.scalars(select(Player).where(
@@ -145,7 +157,7 @@ class SimulationEngine:
                 )
                 self.db.add(season)
                 self.db.flush()
-            offset = self.world.current_date.month - 9
+            offset = max(0, (self.world.current_date - season.start_date).days // 7)
             for i in range(0, len(clubs)-1, 2):
                 h = clubs[(i + offset) % len(clubs)]
                 a = clubs[(i + 1 + offset) % len(clubs)]
@@ -166,7 +178,9 @@ class SimulationEngine:
                     home_goals=hg, away_goals=ag, played=True))
 
     def update_standings(self):
-        pass
+        # Classificações persistentes ainda requerem uma tabela própria no modelo.
+        # Os resultados ficam registados em Match e podem ser agregados pela API.
+        return None
 
     def process_finances(self):
         clubs = self.db.scalars(select(Club).where(
@@ -194,6 +208,8 @@ class SimulationEngine:
         countries = self.db.scalars(select(Country).where(Country.world_id == self.world.id)).all()
         clubs = self.db.scalars(select(Club).where(
             Club.world_id == self.world.id, Club.active == True)).all()
+        if not countries:
+            return
         target = max(12, len(clubs) * 16)
         current = len(self.db.scalars(select(Player).where(
             Player.world_id == self.world.id, Player.retired == False)).all())
